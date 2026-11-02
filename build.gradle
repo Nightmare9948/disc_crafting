@@ -1,0 +1,52 @@
+plugins {
+    id 'fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+repositories {
+    mavenCentral()
+    // Mod Menu 官方仓库：只用于编译期对接模组菜单的"配置"入口，玩家端不强制安装
+    maven { url "https://maven.terraformersmc.com/releases/" }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // 模组菜单的"配置"入口（编译期依赖；没装 Mod Menu 的玩家不受影响）
+    modCompileOnly "com.terraformersmc:modmenu:11.0.5"
+
+    // MP3 解码：jlayer，纯 Java，会一起打进模组 jar，玩家不用另装
+    implementation include('javazoom:jlayer:1.0.1')
+}
+
+processResources {
+    inputs.property "version", project.version
+    inputs.property "displayVersion", project.mod_display_version
+    inputs.property "authors", project.mod_authors
+
+    // filter 按 filteringCharset 读写，不显式设成 UTF-8 时取平台默认，
+    // 会把 description 里的中文破坏成非法 UTF-8：Gradle 仍报 BUILD SUCCESSFUL，
+    // 但最终 JAR 里的 JSON 已经坏了。
+    filteringCharset = 'UTF-8'
+
+    // 只用字符串替换，不用 expand：expand 会把 JSON 字符串里的 \n 解释成真实换行。
+    //   ${version}             完整包版本，只用于 jar 文件名
+    //   ${mod_display_version} 模组列表里显示的版本
+    //   ${mod_authors}         作者署名
+    filesMatching("fabric.mod.json") {
+        filter { line ->
+            line.replace('${version}', project.version.toString())
+                .replace('${mod_display_version}', project.mod_display_version.toString())
+                .replace('${mod_authors}', project.mod_authors.toString())
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach { options.release = 21; options.encoding = 'UTF-8' }
+java { toolchain.languageVersion = JavaLanguageVersion.of(21); withSourcesJar() }
+base { archivesName = project.archives_base_name }

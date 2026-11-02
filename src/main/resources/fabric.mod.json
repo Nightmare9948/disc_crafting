@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "disc_crafting",
+  "version": "${mod_display_version}",
+  "name": "唱片工艺—乐随我心（Disc crafting）",
+  "description": "把本地音频做成唱片，用随身听随身播放。",
+  "authors": [
+    "${mod_authors}"
+  ],
+  "license": "MIT",
+  "icon": "assets/disc_crafting/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "cn.nightmare9948.disccrafting.DiscCrafting"
+    ],
+    "client": [
+      "cn.nightmare9948.disccrafting.client.DiscCraftingClient"
+    ],
+    "modmenu": [
+      "cn.nightmare9948.disccrafting.client.ModMenuIntegration"
+    ]
+  },
+  "suggests": {
+    "modmenu": "*"
+  },
+  "depends": {
+    "fabricloader": ">=0.15.11",
+    "minecraft": ">=1.21 <1.21.2",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "custom": {
+    "disc_crafting:compatibility": {
+      "minecraft": [
+        "1.21",
+        "1.21.1"
+      ],
+      "fabric_loader": ">=0.15.11",
+      "fabric_api": "*",
+      "mod_version": "${mod_display_version}"
+    }
+  }
+}
