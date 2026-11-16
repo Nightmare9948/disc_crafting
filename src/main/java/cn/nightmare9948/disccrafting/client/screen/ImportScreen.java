@@ -7,6 +7,7 @@ import cn.nightmare9948.disccrafting.client.audio.AudioImporter;
 import cn.nightmare9948.disccrafting.client.audio.Track;
 import cn.nightmare9948.disccrafting.client.audio.TrackStore;
 import cn.nightmare9948.disccrafting.client.gui.Gui;
+import cn.nightmare9948.disccrafting.client.gui.SelectableList;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
@@ -41,6 +42,9 @@ public class ImportScreen extends Screen {
     protected void init() {
         this.tracks.clear();
         this.tracks.addAll(TrackStore.all());
+        if (this.selected >= this.tracks.size()) {
+            this.selected = this.tracks.isEmpty() ? -1 : this.tracks.size() - 1;
+        }
         this.left = Math.max(6, (this.width - PANEL_W) / 2);
         this.top = Math.max(6, (this.height - PANEL_H) / 2);
 
@@ -61,36 +65,39 @@ public class ImportScreen extends Screen {
                 button -> this.client.setScreen(new ConfigScreen(this)))
             .dimensions(this.left + 14, this.top + PANEL_H - 28, 90, 20).build());
 
-        int rows = Math.min(this.tracks.size(), 4);
-        for (int i = 0; i < rows; i++) {
-            final int index = i;
-            this.addDrawableChild(ButtonWidget.builder(rowText(i), button -> {
-                this.selected = index;
-                this.clearAndInit();
-            }).dimensions(this.left + 200, this.top + 30 + i * 24, 166, 20).build());
-        }
+        // 曲目库：能上下滚动的列表。曲目多了用滚轮看，不再只显示前四首
+        this.addDrawableChild(new SelectableList(this.left + 200, this.top + 30, 166, 100,
+            new SelectableList.Model() {
+                @Override
+                public int size() {
+                    return tracks.size();
+                }
+
+                @Override
+                public String label(int index) {
+                    Track track = tracks.get(index);
+                    String prefix = index == selected ? "▶ " : "  ";
+                    return prefix + track.title + "  " + track.lengthText();
+                }
+
+                @Override
+                public boolean playing(int index) {
+                    return index == selected;
+                }
+            }, index -> this.selected = index));
 
         this.addDrawableChild(ButtonWidget.builder(Lang.t("button.disc_crafting.make"),
                 button -> openStudio())
-            .dimensions(this.left + 200, this.top + 138, 166, 20).build());
+            .dimensions(this.left + 200, this.top + 146, 166, 20).build());
         this.addDrawableChild(ButtonWidget.builder(Lang.t("button.disc_crafting.done"),
                 button -> this.close())
             .dimensions(this.left + PANEL_W / 2 - 50 + 30, this.top + PANEL_H - 28, 100, 20).build());
     }
 
     private static Text qualityText() {
+        // 参数用纯字符串：Lang 内部走 String.format，塞 Text 进去会变成对象地址
         return Lang.t("button.disc_crafting.quality",
-            Lang.t("quality.disc_crafting." + Settings.qualityName()));
-    }
-
-    private Text rowText(int index) {
-        Track track = this.tracks.get(index);
-        String prefix = index == this.selected ? "▶ " : "  ";
-        String name = track.title;
-        if (name.length() > 14) {
-            name = name.substring(0, 14);
-        }
-        return Text.literal(prefix + name + "  " + track.lengthText());
+            Lang.text("quality.disc_crafting." + Settings.qualityName()));
     }
 
     @Override
@@ -125,7 +132,7 @@ public class ImportScreen extends Screen {
             ? this.tracks.get(this.selected).title : "-";
         context.drawTextWithShadow(this.textRenderer,
             Lang.t("label.disc_crafting.selected").copy().append(Text.literal(selectedName)),
-            this.left + 200, this.top + 124, 0xB7B7C8);
+            this.left + 200, this.top + 132, 0xB7B7C8);
 
         int statusLine = this.top + 168;
         if (!this.status.isEmpty()) {

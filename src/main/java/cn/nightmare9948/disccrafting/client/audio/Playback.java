@@ -39,6 +39,13 @@ public interface Playback {
      */
     void setMuffleStrength(float strength);
 
+    /**
+     * 播放淡入 / 淡出开关。默认什么都不做 —— 只有真的能控制音量的实现才需要处理，
+     * 交回游戏声音系统的那条退路可以不管。
+     */
+    default void setFadeEnabled(boolean enabled) {
+    }
+
     String error();
 
     // ------------------------------------------------------------ 进度条用

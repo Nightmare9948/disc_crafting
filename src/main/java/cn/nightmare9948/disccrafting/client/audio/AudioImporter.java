@@ -22,8 +22,11 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 音频导入：把 MP3 / WAV / OGG 等文件解码成统一的 16 位 PCM，
+ * 音频导入：把 MP3 / WAV / OGG / FLAC 等文件解码成统一的 16 位 PCM，
  * 按玩家选的音质档位重采样后写成 wav 存进本地曲库。
+ *
+ * FLAC 用模组自带的 {@link FlacDecoder}（Java 自带的音频系统不认这种格式）；
+ * 别的格式先试专用解码器，不行再交回系统解码器。
  */
 public final class AudioImporter {
     private AudioImporter() {
@@ -75,6 +78,18 @@ public final class AudioImporter {
             Pcm pcm = decodeOgg(source);
             if (pcm != null) {
                 return pcm;
+            }
+        }
+        if (name.endsWith(".flac")) {
+            try {
+                if (FlacDecoder.probe(source)) {
+                    FlacDecoder.Pcm pcm = FlacDecoder.decode(source);
+                    if (pcm.samples().length > 0) {
+                        return new Pcm(pcm.samples(), pcm.sampleRate(), pcm.channels());
+                    }
+                }
+            } catch (Throwable t) {
+                DiscCrafting.LOGGER.warn("FLAC 解码失败，改用系统解码器", t);
             }
         }
         if (name.endsWith(".mp3")) {

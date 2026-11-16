@@ -27,6 +27,10 @@ public final class StreamPlayback implements Playback {
     private static final float MUFFLE_TAU_SECONDS = 0.055f;
     /** 水底下再压一点总音量，闷感更明显：每 100% 强度压 20%。 */
     private static final float MUFFLE_VOLUME_STEP = 0.2f;
+    /** 淡入时长（秒）。 */
+    private static final float FADE_IN_SECONDS = 0.7f;
+    /** 淡出时长（秒），比淡入短一点，停下时不拖泥带水。 */
+    private static final float FADE_OUT_SECONDS = 0.4f;
 
     private volatile float gain = 1.0f;
     private volatile boolean paused;
@@ -36,6 +40,12 @@ public final class StreamPlayback implements Playback {
     private volatile boolean started;
     private volatile String error;
     private volatile boolean muffled;
+    /** 淡入淡出开关（模组设置里那个），主线程写、播放线程读。 */
+    private volatile boolean fadeEnabled = true;
+    /** 暂停请求：先把声音淡出去，淡完再真正停住。 */
+    private volatile boolean pauseRequested;
+    /** 只在播放线程里改：当前这一块数据用的淡入淡出系数（0~1）。 */
+    private float fadeVolume = 1.0f;
     /** 强度目标（0~3），主线程写、播放线程读。 */
     private volatile float muffleStrengthTarget = 1.0f;
     /** 只在播放线程里改：当前“闷”的程度，0 = 正常，1 = 完全水下。 */
@@ -69,13 +79,19 @@ public final class StreamPlayback implements Playback {
     public void start() {
         if (this.thread != null && this.thread.isAlive()) {
             this.paused = false;
+            this.pauseRequested = false;
             this.stopped = false;
+            if (this.fadeEnabled) {
+                this.fadeVolume = 0.0f;
+            }
             return;
         }
         this.started = true;
         this.paused = false;
+        this.pauseRequested = false;
         this.stopped = false;
         this.finished = false;
+        this.fadeVolume = this.fadeEnabled ? 0.0f : 1.0f;
         // 暂停时拖过进度条的，从头开始在拖到的位置播
         if (this.seekFrame < 0) {
             this.framesPlayed = 0;
@@ -109,7 +125,22 @@ public final class StreamPlayback implements Playback {
             byte[] output = new byte[8192];
             this.lowPass[0] = 0.0f;
             this.lowPass[1] = 0.0f;
-            while (!this.stopped) {
+            this.fadeVolume = this.fadeEnabled ? 0.0f : 1.0f;
+            while (true) {
+                boolean stopping = this.stopped;
+                // 停止 / 暂停都先淡出，淡完再真正停住，不会“啪”一下断掉
+                if (stopping && (!this.fadeEnabled || this.paused || this.fadeVolume <= 0.002f)) {
+                    break;
+                }
+                if (this.pauseRequested && (!this.fadeEnabled || this.fadeVolume <= 0.002f)) {
+                    this.pauseRequested = false;
+                    this.paused = true;
+                    this.fadeVolume = this.fadeEnabled ? 0.0f : 1.0f;
+                    if (opened.isRunning()) {
+                        opened.stop();
+                    }
+                    continue;
+                }
                 if (this.paused) {
                     if (opened.isRunning()) {
                         opened.stop();
@@ -141,7 +172,8 @@ public final class StreamPlayback implements Playback {
                     opened.start();
                 }
                 stepMuffle(read, frameSize);
-                process(raw, output, read, this.gain);
+                stepFade(read, frameSize, (stopping || this.pauseRequested) ? 0.0f : 1.0f);
+                process(raw, output, read, this.gain * this.fadeVolume);
                 opened.write(output, 0, read);
                 this.framesPlayed += read / frameSize;
             }
@@ -210,6 +242,27 @@ public final class StreamPlayback implements Playback {
         }
     }
 
+    /**
+     * 每块数据把淡入淡出系数往目标挪一点：
+     * 开始 / 继续时从 0 爬到 1，暂停 / 停止时从 1 落回 0。
+     */
+    private void stepFade(int length, int frameSize, float target) {
+        if (!this.fadeEnabled) {
+            this.fadeVolume = 1.0f;
+            return;
+        }
+        int frames = Math.max(1, length / Math.max(1, frameSize));
+        float seconds = frames / (float) Math.max(1, this.sampleRate);
+        boolean rising = target > this.fadeVolume;
+        float span = rising ? FADE_IN_SECONDS : FADE_OUT_SECONDS;
+        float step = seconds / Math.max(0.05f, span);
+        if (rising) {
+            this.fadeVolume = Math.min(target, this.fadeVolume + step);
+        } else if (this.fadeVolume > target) {
+            this.fadeVolume = Math.max(target, this.fadeVolume - step);
+        }
+    }
+
     /** 一阶低通的系数（按当前截止频率、采样率算）。 */
     private float lowPassCoefficient(float cutoff) {
         double cut = 2.0 * Math.PI * Math.max(80.0f, cutoff) / Math.max(1, this.sampleRate);
@@ -256,15 +309,22 @@ public final class StreamPlayback implements Playback {
     }
     @Override
     public void stop() {
-        // 不在这里硬关声卡：播放线程下一次写数据时自己会退出并把线路关掉，
+        // 不在这里硬关声卡：播放线程写数据时会先淡出、再自己退出并把线路关掉，
         // 免得正在写的线程抛异常，把“停止”误报成播放失败。
         this.stopped = true;
-        this.paused = false;
+        this.pauseRequested = false;
     }
 
     @Override
     public void pause() {
+        if (this.fadeEnabled && !this.paused && !this.stopped
+            && this.thread != null && this.thread.isAlive()) {
+            // 交给播放线程：先淡出 0.4 秒，再真正停下来
+            this.pauseRequested = true;
+            return;
+        }
         this.paused = true;
+        this.pauseRequested = false;
     }
 
     @Override
@@ -273,13 +333,18 @@ public final class StreamPlayback implements Playback {
             start();
             return;
         }
+        boolean wasSilent = this.paused || this.pauseRequested;
         this.paused = false;
+        this.pauseRequested = false;
         this.stopped = false;
+        if (wasSilent && this.fadeEnabled) {
+            this.fadeVolume = 0.0f;
+        }
     }
 
     @Override
     public boolean isPaused() {
-        return this.paused;
+        return this.paused || this.pauseRequested;
     }
 
     @Override
@@ -289,7 +354,15 @@ public final class StreamPlayback implements Playback {
 
     @Override
     public boolean isActive() {
-        return this.started && !this.stopped && !this.paused && !this.finished;
+        return this.started && !this.stopped && !this.paused && !this.pauseRequested && !this.finished;
+    }
+
+    @Override
+    public void setFadeEnabled(boolean enabled) {
+        this.fadeEnabled = enabled;
+        if (!enabled) {
+            this.fadeVolume = 1.0f;
+        }
     }
 
     @Override

@@ -21,7 +21,7 @@ import java.util.Locale;
  */
 public class ConfigScreen extends Screen {
     private static final int PANEL_W = 320;
-    private static final int PANEL_H = 220;
+    private static final int PANEL_H = 240;
 
     /** 横条里可选的语言，顺序就是这个列表从上到下的顺序。 */
     private static final String[] LANGUAGES = {
@@ -35,8 +35,8 @@ public class ConfigScreen extends Screen {
 
     private static final int BAR_W = PANEL_W - 32;
     private static final int ROW_H = 20;
-    /** 设置区最下面一行（单曲循环 / 水中音效）的下边缘，相对面板顶。 */
-    private static final int SETTINGS_BOTTOM = 144;
+    /** 设置区最下面一行（音符粒子 / 淡入淡出）的下边缘，相对面板顶。 */
+    private static final int SETTINGS_BOTTOM = 176;
 
     private final Screen parent;
     private int left;
@@ -87,6 +87,17 @@ public class ConfigScreen extends Screen {
         addCovered(ButtonWidget.builder(Lang.t("button.disc_crafting.underwater_entry"),
                 button -> openUnderwaterSettings())
             .dimensions(this.left + 164, this.top + 124, 140, 20).build());
+
+        // 音符粒子：点进去单独一页（开关 / 速度 / 样式）
+        addCovered(ButtonWidget.builder(Lang.t("button.disc_crafting.particles_entry"),
+                button -> openParticleSettings())
+            .dimensions(this.left + 16, this.top + 156, 140, 20).build());
+
+        // 播放淡入淡出：放歌时音量慢慢起来，暂停 / 停止时慢慢落下去
+        addCovered(ButtonWidget.builder(fadeText(), button -> {
+            Settings.setFadeEnabled(!Settings.fadeEnabled());
+            button.setMessage(fadeText());
+        }).dimensions(this.left + 164, this.top + 156, 140, 20).build());
 
         this.addDrawableChild(ButtonWidget.builder(Lang.t("button.disc_crafting.done"), button -> back())
             .dimensions(this.left + PANEL_W / 2 - 50, this.top + PANEL_H - 30, 100, 20).build());
@@ -230,13 +241,24 @@ public class ConfigScreen extends Screen {
 
     private Text qualityText() {
         return Lang.t("button.disc_crafting.quality_line",
-            Lang.t("quality.disc_crafting." + Settings.qualityName()));
+            Lang.text("quality.disc_crafting." + Settings.qualityName()));
     }
 
     private void openUnderwaterSettings() {
         if (this.client != null) {
             this.client.setScreen(new UnderwaterSettingsScreen(this));
         }
+    }
+
+    private void openParticleSettings() {
+        if (this.client != null) {
+            this.client.setScreen(new ParticleSettingsScreen(this));
+        }
+    }
+
+    private Text fadeText() {
+        return Lang.t(Settings.fadeEnabled()
+            ? "button.disc_crafting.fade_on" : "button.disc_crafting.fade_off");
     }
 
     private Text loopText() {
@@ -313,7 +335,7 @@ public class ConfigScreen extends Screen {
 
         context.drawTextWithShadow(this.textRenderer, Lang.t("label.disc_crafting.language"),
             this.left + 16, this.top + 28, 0xB7B7C8);
-        int line = this.top + 152;
+        int line = this.top + 186;
         for (net.minecraft.text.OrderedText hint
             : this.textRenderer.wrapLines(Lang.t("hint.disc_crafting.language"), PANEL_W - 32)) {
             context.drawTextWithShadow(this.textRenderer, hint, this.left + 16, line, 0x8A8A9A);

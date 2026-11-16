@@ -15,8 +15,10 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * 播放序列的存档：手持的随身听一条，放在地上的随身听各一条（按实体编号记），
- * 存在 config/disc_crafting/playlists.json。
+ * 播放序列的存档：放在地上的随身听各一条（按实体编号记），存在 config/disc_crafting/playlists.json。
+ *
+ * 手持的随身听现在按“每一支”分开存（见 {@link WalkmanStates}），这里保留的那一条
+ * 只是给老版本升级上来的玩家做迁移用。
  */
 public final class PlaylistStore {
     private PlaylistStore() {
@@ -33,6 +35,7 @@ public final class PlaylistStore {
         return Settings.dir().resolve("playlists.json");
     }
 
+    /** 老版本那份全局序列：只用于升级时迁移到第一支随身听，不再参与播放。 */
     public static Playlist handheld() {
         load();
         return handheld;
@@ -120,6 +123,8 @@ public final class PlaylistStore {
         } catch (Throwable throwable) {
             DiscCrafting.LOGGER.warn("保存播放序列失败", throwable);
         }
+        // 手持随身听的序列现在按“每一支”分开存，这里顺手把那份也写下去
+        WalkmanStates.saveNow();
     }
 
     private static JsonObject toJson(String key, Playlist playlist) {

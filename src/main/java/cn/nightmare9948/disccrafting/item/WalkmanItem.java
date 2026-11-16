@@ -2,11 +2,13 @@ package cn.nightmare9948.disccrafting.item;
 
 import cn.nightmare9948.disccrafting.ClientBridge;
 import cn.nightmare9948.disccrafting.Lang;
+import cn.nightmare9948.disccrafting.ModComponents;
 import cn.nightmare9948.disccrafting.ModEntities;
 import cn.nightmare9948.disccrafting.component.DiscSource;
 import cn.nightmare9948.disccrafting.entity.WalkmanEntity;
 import cn.nightmare9948.disccrafting.util.HandScan;
 import net.minecraft.block.Blocks;
+import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -23,6 +25,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
 
 import java.util.List;
+import java.util.UUID;
 
 /**
  * 随身听：一只手拿它、另一只手拿唱片（自制唱片或原版唱片都行）才能放歌。
@@ -30,7 +33,10 @@ import java.util.List;
  *
  * 放下的两种拿法：
  * 另一只手拿着唱片 —— 放下的那台放唱片上的那一首（老规矩）；
- * 另一只手空着 —— 也能放，曲目和所有设置直接照抄手里这台随身听。
+ * 另一只手空着 —— 也能放，曲目和所有设置直接照抄手里这台随身听（放下时是停着的）。
+ *
+ * 每一台随身听都带着自己的编号：曲目库、音量、单曲循环、播放进度都按编号分开存，
+ * 背包里放两支也不会互相串味。
  *
  * 跟唱片机有关的规矩（两个动作不能在同一击里同时发生）：
  * 站着右键唱片机、另一只手拿着唱片 = 只把唱片放进去，随身听不放上去；
@@ -106,6 +112,21 @@ public class WalkmanItem extends Item {
         context.getStack().decrementUnlessCreative(1, player);
         world.playSound(null, pos, SoundEvents.BLOCK_STONE_PLACE, SoundCategory.BLOCKS, 1.0f, 0.8f);
         return ActionResult.SUCCESS;
+    }
+
+    /**
+     * 每一台随身听都要有自己的编号。服务端在它第一次进背包时写上去，之后跟着物品一起
+     * 存档、一起同步给客户端；玩家那边就按这个编号读写这台自己的设置。
+     */
+    @Override
+    public void inventoryTick(ItemStack stack, World world, Entity entity, int slot, boolean selected) {
+        if (world == null || world.isClient) {
+            return;
+        }
+        String id = stack.get(ModComponents.WALKMAN_ID);
+        if (id == null || id.isEmpty()) {
+            stack.set(ModComponents.WALKMAN_ID, UUID.randomUUID().toString());
+        }
     }
 
     private static boolean isWater(World world, BlockPos pos) {

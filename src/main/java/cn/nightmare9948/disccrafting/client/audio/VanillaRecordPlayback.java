@@ -32,6 +32,9 @@ public final class VanillaRecordPlayback implements Playback {
     private volatile boolean muffled;
     /** 水中音效强度，0~3；这条退路上只能按它多压一点音量。 */
     private volatile float muffleStrength = 1.0f;
+    /** 淡入开关：退路上只能按时间慢慢抬音量，效果比自解码那条路粗糙些。 */
+    private volatile boolean fadeEnabled = true;
+    private volatile long fadeStartAt = System.currentTimeMillis();
     private RecordSound instance;
     private long startedAt;
     private long positionBase;
@@ -57,7 +60,8 @@ public final class VanillaRecordPlayback implements Playback {
         this.positionBase = 0;
         this.runningSince = this.startedAt;
         this.instance = new RecordSound(this.soundEvent, this.position, this.followPlayer);
-        this.instance.setGain(this.gain * this.muffleGain());
+        this.fadeStartAt = System.currentTimeMillis();
+        this.instance.setGain(this.gain * this.muffleGain() * this.fadeGain());
         manager.play(this.instance);
     }
 
@@ -80,6 +84,7 @@ public final class VanillaRecordPlayback implements Playback {
     @Override
     public void resume() {
         this.paused = false;
+        this.fadeStartAt = System.currentTimeMillis();
         applyGain();
     }
 
@@ -134,8 +139,26 @@ public final class VanillaRecordPlayback implements Playback {
 
     private void applyGain() {
         if (this.instance != null && !this.paused) {
-            this.instance.setGain(this.gain * this.muffleGain());
+            this.instance.setGain(this.gain * this.muffleGain() * this.fadeGain());
         }
+    }
+
+    @Override
+    public void setFadeEnabled(boolean enabled) {
+        this.fadeEnabled = enabled;
+        applyGain();
+    }
+
+    /** 淡入：开始放之后 0.7 秒内从两成音量抬到满。 */
+    private float fadeGain() {
+        if (!this.fadeEnabled) {
+            return 1.0f;
+        }
+        long elapsed = System.currentTimeMillis() - this.fadeStartAt;
+        if (elapsed >= 700L) {
+            return 1.0f;
+        }
+        return Math.max(0.02f, elapsed / 700.0f);
     }
 
     /** 强度越高压得越狠；300% 时大约只剩四成音量。 */

@@ -1,7 +1,6 @@
 package cn.nightmare9948.disccrafting.client.screen;
 
 import cn.nightmare9948.disccrafting.Lang;
-import cn.nightmare9948.disccrafting.client.Settings;
 import cn.nightmare9948.disccrafting.client.audio.ClientAudio;
 import cn.nightmare9948.disccrafting.client.audio.Playback;
 import cn.nightmare9948.disccrafting.client.audio.Playlist;
@@ -56,26 +55,23 @@ public class WalkmanHandheldScreen extends WalkmanPanelScreen {
 
     @Override
     protected boolean loopEnabled() {
-        return Settings.loopSingle();
+        // 单曲循环跟着这支随身听自己走，不是全模组共用一个开关
+        return ClientAudio.get().handheldLoop();
     }
 
     @Override
     protected void setLoop(boolean loop) {
-        Settings.setLoopSingle(loop);
-        Playback current = playback();
-        if (current != null) {
-            current.setLooping(loop);
-        }
+        ClientAudio.get().setHandheldLoop(loop);
     }
 
     @Override
     protected int volumePercent() {
-        return Settings.volumePercent();
+        return ClientAudio.get().handheldVolumePercent();
     }
 
     @Override
     protected void setVolume(int percent) {
-        Settings.setVolumePercent(percent);
+        ClientAudio.get().setHandheldVolumePercent(percent);
     }
 
     @Override

@@ -18,6 +18,7 @@ import net.minecraft.client.sound.Sound;
 import net.minecraft.client.sound.WeightedSoundSet;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ItemStack;
 import net.minecraft.particle.ParticleTypes;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.registry.RegistryKeys;
@@ -25,6 +26,7 @@ import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.resource.Resource;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
@@ -84,11 +86,20 @@ public final class ClientAudio {
             this.finishedReported = false;
             this.errorReported = false;
             this.playback.setGain(gain);
+            this.playback.setFadeEnabled(Settings.fadeEnabled());
             this.playback.start();
         }
     }
 
     private Session handheld;
+    /** 现在手里那支随身听的编号：每支随身听的状态互相独立，靠它区分。 */
+    private String handheldKey;
+    /** 这个世界里已经试过“恢复上次进度”了，别每 tick 都来一次。 */
+    private boolean handheldRestored;
+    /** 世界在不在：从“没世界”切到“有世界”时重置上面那个标志。 */
+    private boolean worldActive;
+    /** 进度写回状态的节流计时。 */
+    private int progressTimer;
     private final Map<BlockPos, Session> jukeboxes = new LinkedHashMap<>();
     private final Map<UUID, Session> entities = new LinkedHashMap<>();
     private int scanTimer;
@@ -117,114 +128,300 @@ public final class ClientAudio {
     // ---------------------------------------------------------------- 随身听
 
     /**
+     * 手上（主手或副手）那支随身听；没有就返回空栈。
+     * 每一支随身听在物品上带着自己的编号，所有设置都按编号分开存。
+     */
+    public static ItemStack heldWalkman(MinecraftClient client) {
+        if (client == null || client.player == null) {
+            return ItemStack.EMPTY;
+        }
+        Hand hand = HandScan.walkmanHand(client.player);
+        return hand == null ? ItemStack.EMPTY : client.player.getStackInHand(hand);
+    }
+
+    private static String heldKey(MinecraftClient client) {
+        ItemStack stack = heldWalkman(client);
+        return stack.isEmpty() ? WalkmanStates.UNSIGNED_KEY : WalkmanStates.keyOf(stack);
+    }
+
+    /**
+     * 现在手里这支随身听的编号。手里换了一支时，先把上一支停住、
+     * 把进度记到它自己名下；如果是“刚拿到手、编号还没同步过来”的那一小会儿，
+     * 就把临时状态认领成正式编号，不会把正在放的音乐打断。
+     */
+    private String currentKey(MinecraftClient client) {
+        ItemStack stack = heldWalkman(client);
+        if (stack.isEmpty()) {
+            return WalkmanStates.UNSIGNED_KEY;
+        }
+        String key = WalkmanStates.keyOf(stack);
+        if (this.handheld != null && !key.equals(this.handheldKey)) {
+            if (WalkmanStates.UNSIGNED_KEY.equals(this.handheldKey)) {
+                WalkmanStates.claim(key);
+                this.handheldKey = key;
+            } else {
+                stopHandheld();
+            }
+        }
+        return key;
+    }
+
+    /** 手持随身听自己的那份状态（曲目库、音量、循环、上次进度都在这）。 */
+    public static WalkmanStates.State handheldState() {
+        return WalkmanStates.of(heldKey(MinecraftClient.getInstance()));
+    }
+
+    public int handheldVolumePercent() {
+        return handheldState().volumePercent;
+    }
+
+    public void setHandheldVolumePercent(int percent) {
+        WalkmanStates.State state = handheldState();
+        state.volumePercent = Math.max(0, Math.min(200, percent));
+        WalkmanStates.markDirty();
+        WalkmanStates.flushIfDue();
+    }
+
+    public boolean handheldLoop() {
+        return handheldState().loop;
+    }
+
+    public void setHandheldLoop(boolean loop) {
+        WalkmanStates.State state = handheldState();
+        state.loop = loop;
+        if (this.handheld != null) {
+            this.handheld.playback.setLooping(loop);
+        }
+        WalkmanStates.markDirty();
+        WalkmanStates.flushIfDue();
+    }
+
+    /**
      * 一个键搞定：没在放就开始，在放就暂停。
      *
      * 换唱片的情况：正在放唱片 1 时把另一只手的唱片换成唱片 2，
      * 按一下先暂停唱片 1（还是原来那首），再按一下才切到唱片 2 从头放。
+     * 手里换成另一支随身听时，先把上一支停住记住进度，再按这支自己的进度来。
      */
     public void toggleHandheld() {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null) {
             return;
         }
-        Playlist playlist = PlaylistStore.handheld();
-        boolean playlistMode = playlist.isEnabled() && !playlist.isEmpty();
+        ItemStack stack = heldWalkman(client);
+        if (stack.isEmpty()) {
+            actionBar(Lang.t("message.disc_crafting.need_walkman"));
+            return;
+        }
+        String key = currentKey(client);
+        WalkmanStates.State state = WalkmanStates.of(key);
+        boolean playlistMode = state.playlist.isEnabled() && !state.playlist.isEmpty();
         if (this.handheld != null && !this.handheld.playback.isFinished()) {
             Playback playback = this.handheld.playback;
             if (playback.isPaused()) {
                 DiscSource held = playlistMode ? null : HandScan.heldSource(client.player);
                 if (held != null && !held.isEmpty() && !held.equals(this.handheld.source)) {
                     // 手上换了另一张唱片：切过去
-                    startHandheld();
+                    startHandheld(client, key);
                 } else {
                     playback.resume();
+                    state.playing = true;
+                    WalkmanStates.markDirty();
                 }
                 return;
             }
             playback.pause();
+            saveHandheldState();
             return;
         }
-        startHandheld();
+        startHandheld(client, key);
     }
 
     public void stopHandheld() {
         if (this.handheld != null) {
+            saveHandheldState();
             this.handheld.playback.stop();
             this.handheld = null;
         }
+        this.handheldKey = null;
     }
 
-    private void startHandheld() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null) {
-            return;
-        }
-        if (HandScan.walkmanHand(client.player) == null) {
-            actionBar(Lang.t("message.disc_crafting.need_walkman"));
-            return;
-        }
-        Playlist playlist = PlaylistStore.handheld();
-        boolean playlistMode = playlist.isEnabled() && !playlist.isEmpty();
+    /** 开始放这一支随身听：列表播放 > 手上拿着的唱片 > 上次放到一半的那一首。 */
+    private void startHandheld(MinecraftClient client, String key) {
+        WalkmanStates.State state = WalkmanStates.of(key);
+        Playlist playlist = state.playlist;
+        DiscSource remembered = rememberedSource(state);
         Session session;
-        if (playlistMode) {
-            session = startPlaylist(playlist, client.player.getEyePos(), true, Settings.loopSingle());
+        if (playlist.isEnabled() && !playlist.isEmpty()) {
+            // 列表播放：上次放的那首还在序列里就接着它，否则按序列从头开始
+            if (remembered != null && playlist.contains(remembered.trackId())) {
+                playlist.setIndex(indexOf(playlist, remembered.trackId()));
+            }
+            session = startPlaylist(playlist, client.player.getEyePos(), true, state.loop);
             if (session == null) {
                 actionBar(Lang.t("message.disc_crafting.missing_audio"));
                 return;
             }
+            if (remembered != null && sameSource(session.source, remembered)) {
+                seekToStart(session.playback, state.positionMs);
+            }
         } else {
-            DiscSource source = HandScan.heldSource(client.player);
-            if (source == null || source.isEmpty()) {
+            DiscSource held = HandScan.heldSource(client.player);
+            DiscSource source;
+            long resumeMs = 0;
+            if (held != null && !held.isEmpty()) {
+                source = held;
+                // 另一只手还是上次那张唱片：接着上次的进度放
+                if (sameSource(held, remembered)) {
+                    resumeMs = state.positionMs;
+                }
+            } else if (remembered != null) {
+                // 没有唱片也能接着放：进度记忆里存着上次那一首
+                source = remembered;
+                resumeMs = state.positionMs;
+            } else {
                 actionBar(Lang.t("message.disc_crafting.need_disc"));
                 return;
             }
-            session = createSession(source, client.player.getEyePos(), true, Settings.loopSingle());
+            session = createSession(source, client.player.getEyePos(), true, state.loop);
             if (session == null) {
                 actionBar(Lang.t(source.isVanilla()
                     ? "message.disc_crafting.missing_song" : "message.disc_crafting.missing_audio"));
                 return;
             }
+            seekToStart(session.playback, resumeMs);
         }
         stopHandheld();
         session.started = true;
-        session.playback.setGain(masterGain(client));
+        session.playback.setFadeEnabled(Settings.fadeEnabled());
+        session.playback.setGain(handheldGain(client, state));
         session.playback.start();
         this.handheld = session;
+        this.handheldKey = key;
+        state.playing = true;
+        state.trackId = session.source.trackId();
+        state.songId = session.source.songId();
+        WalkmanStates.markDirty();
+    }
+
+    /**
+     * 重进游戏之后的第一次：这支随身听上次放到哪一首、第几毫秒，就在这里接着来。
+     * 上次是“正在放”就自动接着放；上次是暂停着退出的，就停在原处等玩家按播放。
+     */
+    private void restoreHandheld(MinecraftClient client, String key, WalkmanStates.State state) {
+        DiscSource remembered = rememberedSource(state);
+        if (remembered == null) {
+            return;
+        }
+        Playlist playlist = state.playlist;
+        Session session;
+        if (playlist.isEnabled() && !playlist.isEmpty() && playlist.contains(remembered.trackId())) {
+            playlist.setIndex(indexOf(playlist, remembered.trackId()));
+            session = createSession(remembered, client.player.getEyePos(), true, state.loop);
+            if (session != null) {
+                session.playlist = playlist;
+                playlist.markPlaying(remembered.trackId());
+            }
+        } else {
+            session = createSession(remembered, client.player.getEyePos(), true, state.loop);
+        }
+        if (session == null) {
+            return;
+        }
+        session.started = true;
+        seekToStart(session.playback, state.positionMs);
+        session.playback.setFadeEnabled(Settings.fadeEnabled());
+        session.playback.setGain(handheldGain(client, state));
+        if (state.playing) {
+            session.playback.start();
+        } else {
+            session.playback.pause();
+        }
+        this.handheld = session;
+        this.handheldKey = key;
+    }
+
+    /** 把这一路现在的曲目、进度、播放状态记到这支随身听自己的状态里。 */
+    private void saveHandheldState() {
+        if (this.handheld == null || this.handheldKey == null) {
+            return;
+        }
+        WalkmanStates.State state = WalkmanStates.of(this.handheldKey);
+        DiscSource source = this.handheld.source;
+        if (source != null && !source.isEmpty()) {
+            state.trackId = source.trackId();
+            state.songId = source.songId();
+        }
+        Playback playback = this.handheld.playback;
+        state.positionMs = Math.max(0, playback.positionMs());
+        // 按 Esc 停住的那一路只是“被游戏暂停”，玩家其实还在听：重进游戏照旧自动接着放
+        state.playing = playback.isActive()
+            || (this.suspendedForPause && this.pausedByGame.contains(this.handheld));
+        state.loop = playback.isLooping();
+        if (this.handheld.playlist != null) {
+            // 序列里也记一下“放到第几首”，下次接着走
+            String playing = source == null || source.trackId().isEmpty()
+                ? this.handheld.playlist.current() : source.trackId();
+            int index = indexOf(this.handheld.playlist, playing);
+            if (index >= 0) {
+                this.handheld.playlist.setIndex(index);
+            }
+        }
+        WalkmanStates.markDirty();
     }
 
     /** 只要随身听还拿在主手或副手，就一直放，不再管唱片是不是还在手上。 */
     private void tickHandheld(MinecraftClient client) {
+        ItemStack stack = heldWalkman(client);
+        if (stack.isEmpty()) {
+            if (this.handheld != null) {
+                stopHandheld();
+            }
+            return;
+        }
+        String key = currentKey(client);
+        WalkmanStates.State state = WalkmanStates.of(key);
         if (this.handheld == null) {
-            return;
+            if (!this.handheldRestored) {
+                this.handheldRestored = true;
+                restoreHandheld(client, key, state);
+            }
+            if (this.handheld == null) {
+                return;
+            }
         }
-        if (client.player == null) {
-            stopHandheld();
-            return;
-        }
-        if (HandScan.walkmanHand(client.player) == null) {
-            stopHandheld();
-            return;
-        }
+        Session session = this.handheld;
+        // 这些设置每 tick 都按这支随身听自己的状态来：界面上一改立刻生效
+        session.playback.setLooping(state.loop);
+        session.playback.setGain(handheldGain(client, state));
+        session.playback.setFadeEnabled(Settings.fadeEnabled());
         // 水中音效：人在水里就当手持的随身听泡在水里，进水闷住、出水恢复；
         // 闷多深由设置里的强度滑块决定（0~300%，100% 是默认）
-        this.handheld.playback.setMuffleStrength(Settings.underwaterStrengthScale());
-        this.handheld.playback.setMuffled(
+        session.playback.setMuffleStrength(Settings.underwaterStrengthScale());
+        session.playback.setMuffled(
             Settings.underwaterSound() && playerInWater(client.player));
-        this.handheld.playback.setLooping(Settings.loopSingle());
-        if (this.handheld.playback.isFinished()) {
+        if (this.progressTimer++ % 40 == 0) {
+            saveHandheldState();
+        }
+        if (session.playback.isFinished()) {
             // “是不是列表播放”按此刻的开关算：中途拨开关不打断当前这一首，只影响下一首
-            Playlist live = PlaylistStore.handheld();
+            Playlist live = state.playlist;
             Session next = null;
             if (live.isEnabled() && !live.isEmpty()) {
                 // 从单张唱片切进列表时，避开正放着的这一首（随机模式下不能原地重复）
-                String avoid = trackIdOf(this.handheld.source);
-                next = this.handheld.playlist == null
-                    ? startPlaylist(live, client.player.getEyePos(), true, Settings.loopSingle(), avoid)
-                    : nextPlaylistSession(live, client.player.getEyePos(), true, Settings.loopSingle(), avoid);
+                String avoid = trackIdOf(session.source);
+                next = session.playlist == null
+                    ? startPlaylist(live, client.player.getEyePos(), true, state.loop, avoid)
+                    : nextPlaylistSession(live, client.player.getEyePos(), true, state.loop, avoid);
             }
             if (next != null) {
-                this.handheld.swap(next, masterGain(client));
+                session.swap(next, handheldGain(client, state));
             } else {
+                // 放完了：进度回到开头，下次点播放从头来
+                WalkmanStates.State finishedState = WalkmanStates.of(this.handheldKey);
+                finishedState.positionMs = 0;
+                finishedState.playing = false;
+                WalkmanStates.markDirty();
                 stopHandheld();
             }
         }
@@ -239,9 +436,9 @@ public final class ClientAudio {
         return this.handheld == null ? null : this.handheld.source;
     }
 
-    /** 手持随身听的播放序列。 */
+    /** 手持随身听的播放序列（就是这支随身听自己的那一份）。 */
     public Playlist handheldPlaylist() {
-        return PlaylistStore.handheld();
+        return WalkmanStates.playlist(heldKey(MinecraftClient.getInstance()));
     }
 
     /** 地上某台随身听的播放序列。 */
@@ -256,7 +453,7 @@ public final class ClientAudio {
      */
     public void reloadHandheld() {
         if (this.handheld != null) {
-            this.handheld.playback.setLooping(Settings.loopSingle());
+            this.handheld.playback.setLooping(handheldState().loop);
         }
     }
 
@@ -282,26 +479,29 @@ public final class ClientAudio {
         if (client.player == null || HandScan.walkmanHand(client.player) == null) {
             return false;
         }
-        Playlist playlist = PlaylistStore.handheld();
+        WalkmanStates.State state = WalkmanStates.of(heldKey(client));
+        Playlist playlist = state.playlist;
         if (!playlist.isEnabled() || playlist.isEmpty()) {
             return false;
         }
         Session session = this.handheld;
         Session fresh = buildSkip(playlist, session, direction,
-            client.player.getEyePos(), true, Settings.loopSingle());
+            client.player.getEyePos(), true, state.loop);
         if (fresh == null) {
             actionBar(Lang.t("message.disc_crafting.missing_audio"));
             return false;
         }
         if (session == null) {
             fresh.started = true;
-            fresh.playback.setGain(masterGain(client));
+            fresh.playback.setFadeEnabled(Settings.fadeEnabled());
+            fresh.playback.setGain(handheldGain(client, state));
             fresh.playback.start();
             this.handheld = fresh;
+            this.handheldKey = heldKey(client);
             return true;
         }
         boolean silent = !session.playback.isActive();
-        session.swap(fresh, masterGain(client));
+        session.swap(fresh, handheldGain(client, state));
         if (silent) {
             // 原来是暂停 / 停着的：换到新的一首但先不出声，等玩家点播放
             session.playback.pause();
@@ -426,13 +626,23 @@ public final class ClientAudio {
     public void tick(MinecraftClient client) {
         ClientWorld world = client.world;
         if (world == null || client.player == null) {
-            stopAll();
+            if (this.worldActive) {
+                // 退出世界 / 回主菜单：把进度和设置写进硬盘，下次进来接着来
+                this.worldActive = false;
+                stopAll();
+            }
             return;
+        }
+        if (!this.worldActive) {
+            this.worldActive = true;
+            this.handheldRestored = false;
         }
         // 游戏暂停了（单人按 Esc 的那个暂停界面）：模组这边所有声音一起停住，
         // 进度、音量、播放列表都原地不动；退出暂停再接着放，不会从头开始。
         if (isGamePaused(client)) {
             suspendForPause();
+            saveHandheldState();
+            WalkmanStates.flushIfDue();
             return;
         }
         if (this.suspendedForPause) {
@@ -447,11 +657,12 @@ public final class ClientAudio {
         if (this.handheld != null) {
             Session session = this.handheld;
             reportError(session);
-            session.playback.setGain(master);
-            if (session.playback.isActive() && master > 0.02f && world.getTime() % 6 == 0) {
-                spawnNotes(world, client.player.getEyePos().add(0, 0.45, 0), 1);
+            if (session.playback.isActive() && handheldGain(client, handheldState()) > 0.02f) {
+                spawnNotesIfDue(world, headTop(client.player));
             }
         }
+        WalkmanStates.flushIfDue();
+        EntityProgress.flushIfDue();
 
         Iterator<Map.Entry<BlockPos, Session>> iterator = this.jukeboxes.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -470,10 +681,11 @@ public final class ClientAudio {
                 }
             }
             reportError(session);
+            session.playback.setFadeEnabled(Settings.fadeEnabled());
             float gain = master * (float) distanceGain(pos.toCenterPos(), client.player.getEyePos(), JUKEBOX_RANGE);
             session.playback.setGain(gain);
-            if (session.playback.isActive() && gain > 0.02f && world.getTime() % 4 == 0) {
-                spawnNotes(world, pos.toCenterPos().add(0, 1.1, 0), 1);
+            if (session.playback.isActive() && gain > 0.02f) {
+                spawnNotesIfDue(world, pos.toCenterPos().add(0, 1.1, 0));
             }
         }
 
@@ -491,6 +703,7 @@ public final class ClientAudio {
             }
             // 地上那台随身听自己的播放状态：暂停就真的停住，继续就接着放
             session.playback.setLooping(entity.isLooping());
+            session.playback.setFadeEnabled(Settings.fadeEnabled());
             // 水漫到这台随身听身上时，声音跟着闷住；水退了恢复，深浅同样看强度设置
             session.playback.setMuffleStrength(Settings.underwaterStrengthScale());
             session.playback.setMuffled(
@@ -546,8 +759,12 @@ public final class ClientAudio {
             boolean audible = session.playback.isActive() && entity.getVolume() > 0.02f && reach > 0.02f;
             session.playback.setGain(gain);
             reportError(session);
-            if (audible && world.getTime() % 4 == 0) {
-                spawnNotes(world, entity.getPos().add(0, 0.55, 0), 1);
+            if (audible) {
+                spawnNotesIfDue(world, entity.getPos().add(0, entity.getHeight() + 0.1, 0));
+            }
+            // 地上这台“放到哪儿了”也记一份：退出游戏再进来能接着放
+            if (world.getTime() % 40 == 0) {
+                EntityProgress.remember(entity.getUuid(), session.source, session.playback.positionMs());
             }
         }
     }
@@ -588,6 +805,12 @@ public final class ClientAudio {
                 continue;
             }
             session.entityId = entity.getUuid();
+            // 上次退出游戏时这台放到哪儿了？曲目对得上就接着放
+            long savedPosition = EntityProgress.positionFor(entity.getUuid(), session.source);
+            if (savedPosition > 0) {
+                seekToStart(session.playback, savedPosition);
+            }
+            session.playback.setFadeEnabled(Settings.fadeEnabled());
             session.playback.setGain(deviceGain(client) * entity.getVolume());
             if (entity.isPlaying()) {
                 session.started = true;
@@ -601,7 +824,7 @@ public final class ClientAudio {
 
     /**
      * 继承列表时把“一切设置”也带过去：这台随身听的音量和单曲循环跟手上那台保持一致；
-     * 空手放置时连正在放的那一首和播放状态也一起照抄。
+     * 空手放置时连正在放的那一首也一起照抄，但放下时是停着的，等玩家按播放。
      *
      * 音量直接写在这台实体身上（本机立刻生效，界面读下去就是手里那台的音量），
      * 再用控制包告诉服务端，让别的地方看到的也是同一个值。
@@ -613,10 +836,11 @@ public final class ClientAudio {
         entity.setVolume(volume);
         entity.setLooping(loop);
         if (inherited.inheritTrack()) {
-            // 另一只手空着放的：曲目、播放状态也照抄手上那台，放下就接着放同一首
+            // 另一只手空着放的：曲目照抄手上那台，但放下时默认是停止播放
             entity.setTrackId(inherited.trackId());
             entity.setSongId(inherited.songId());
-            entity.setPlaying(inherited.playing());
+            // 继承过来的这台默认停着：想听就自己按播放
+            entity.setPlaying(false);
         }
         // 曲目一起交给服务端：本机曲目编号只有客户端知道，不发过去就存不住
         ClientPlayNetworking.send(new WalkmanControlPayload(
@@ -640,6 +864,12 @@ public final class ClientAudio {
     }
 
     public void stopAll() {
+        // 每一路都先把“放到哪儿了”记下来再停，退出游戏后下次能接着来
+        saveHandheldState();
+        for (Map.Entry<UUID, Session> entry : this.entities.entrySet()) {
+            Session session = entry.getValue();
+            EntityProgress.remember(entry.getKey(), session.source, session.playback.positionMs());
+        }
         stopHandheld();
         for (Session session : this.jukeboxes.values()) {
             session.playback.stop();
@@ -651,6 +881,9 @@ public final class ClientAudio {
         this.entities.clear();
         this.pausedByGame.clear();
         this.suspendedForPause = false;
+        this.handheldRestored = false;
+        WalkmanStates.saveNow();
+        EntityProgress.saveNow();
     }
 
     // ---------------------------------------------------------------- 游戏暂停
@@ -778,6 +1011,48 @@ public final class ClientAudio {
         return session;
     }
 
+    /** 状态里记的那一首（上次放到一半的）；没记过就返回 null。 */
+    private static DiscSource rememberedSource(WalkmanStates.State state) {
+        if (state == null) {
+            return null;
+        }
+        DiscSource source = new DiscSource(state.trackId, state.songId);
+        return source.isEmpty() ? null : source;
+    }
+
+    private static boolean sameSource(DiscSource first, DiscSource second) {
+        if (first == null || second == null) {
+            return false;
+        }
+        return first.trackId().equals(second.trackId()) && first.songId().equals(second.songId());
+    }
+
+    /** 某个曲目在序列里排第几；不在序列里就返回 -1。 */
+    private static int indexOf(Playlist playlist, String trackId) {
+        if (playlist == null || trackId == null || trackId.isEmpty()) {
+            return -1;
+        }
+        List<String> ids = playlist.trackIds();
+        for (int i = 0; i < ids.size(); i++) {
+            if (trackId.equals(ids.get(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** 恢复进度：位置得合理（在曲子中间，不是只剩最后两秒）才跳过去。 */
+    private static void seekToStart(Playback playback, long positionMs) {
+        if (playback == null || positionMs <= 0 || !playback.canSeek()) {
+            return;
+        }
+        long duration = playback.durationMs();
+        if (duration > 0 && positionMs > duration - 1500L) {
+            return;
+        }
+        playback.seekTo(positionMs);
+    }
+
     /** 这张唱片对应哪个曲目编号（本地曲目用 trackId，原版唱片用 songId），用来排除重复。 */
     private static String trackIdOf(DiscSource source) {
         if (source == null || source.isEmpty()) {
@@ -799,6 +1074,7 @@ public final class ClientAudio {
             Path file = TrackStore.fileOf(track);
             StreamPlayback playback = new StreamPlayback(() -> new WavSource(file), track.durationMs);
             playback.setLooping(loop);
+            playback.setFadeEnabled(Settings.fadeEnabled());
             return new Session(source, playback);
         }
         JukeboxSong song = resolveSong(source.songId());
@@ -811,6 +1087,7 @@ public final class ClientAudio {
             StreamPlayback playback = new StreamPlayback(
                 () -> new OggAssetSource(new ByteArrayInputStream(ogg)), durationMs);
             playback.setLooping(loop);
+            playback.setFadeEnabled(Settings.fadeEnabled());
             return new Session(source, playback);
         }
         // 实在读不到音频文件，退回到游戏自己的声音系统（没有进度和拖动）
@@ -906,8 +1183,15 @@ public final class ClientAudio {
         return song != null ? Math.max(0, song.getLengthInTicks() * 50L) : 0;
     }
 
+    /** 唱片机用的音量：模组设置里的默认音量 x 游戏自己的“唱片 / 音乐”音量。 */
     private static float masterGain(MinecraftClient client) {
         return Settings.volumeGain() * client.options.getSoundVolume(SoundCategory.RECORDS);
+    }
+
+    /** 手持随身听用的音量：这支随身听自己的 0~200% x 游戏自己的“唱片 / 音乐”音量。 */
+    private static float handheldGain(MinecraftClient client, WalkmanStates.State state) {
+        int percent = state == null ? 100 : Math.max(0, Math.min(200, state.volumePercent));
+        return (percent / 100.0f) * client.options.getSoundVolume(SoundCategory.RECORDS);
     }
 
     /**
@@ -954,14 +1238,54 @@ public final class ClientAudio {
         return factor * factor;
     }
 
-    private static void spawnNotes(ClientWorld world, Vec3d pos, int count) {
-        for (int i = 0; i < count; i++) {
-            double random = world.random.nextDouble();
-            world.addParticle(ParticleTypes.NOTE,
-                pos.x + (world.random.nextDouble() - 0.5) * 0.4,
-                pos.y + world.random.nextDouble() * 0.25,
-                pos.z + (world.random.nextDouble() - 0.5) * 0.4,
-                random, random, random);
+    /** 玩家头顶的位置：音符粒子从这儿往上飘，不再挡着眼睛。 */
+    private static Vec3d headTop(PlayerEntity player) {
+        return player.getPos().add(0.0, player.getHeight() + 0.12, 0.0);
+    }
+
+    /**
+     * 按模组设置决定这会儿冒不冒音符粒子、冒什么样子的：
+     * 速度决定隔几 tick 冒一次，样式决定是单个音符、绕一圈还是星尘。
+     */
+    private void spawnNotesIfDue(ClientWorld world, Vec3d pos) {
+        if (!Settings.noteParticles()) {
+            return;
+        }
+        if (world.getTime() % Math.max(1, Settings.particleIntervalTicks()) != 0) {
+            return;
+        }
+        switch (Settings.particleStyle()) {
+            case 1 -> {
+                // 环绕：在头顶绕着小圈飘
+                double angle = (world.getTime() % 80) / 80.0 * Math.PI * 2.0;
+                for (int i = 0; i < 3; i++) {
+                    double a = angle + i * (Math.PI * 2.0 / 3.0);
+                    world.addParticle(ParticleTypes.NOTE,
+                        pos.x + Math.cos(a) * 0.42,
+                        pos.y + 0.05 + i * 0.1,
+                        pos.z + Math.sin(a) * 0.42,
+                        world.random.nextDouble(), 0.02, 0.0);
+                }
+            }
+            case 2 -> {
+                // 星尘：细细的点，比音符低调
+                for (int i = 0; i < 2; i++) {
+                    world.addParticle(ParticleTypes.ELECTRIC_SPARK,
+                        pos.x + (world.random.nextDouble() - 0.5) * 0.5,
+                        pos.y + world.random.nextDouble() * 0.3,
+                        pos.z + (world.random.nextDouble() - 0.5) * 0.5,
+                        0.0, 0.015, 0.0);
+                }
+            }
+            default -> {
+                // 经典音符：一个音符号往上飘
+                double random = world.random.nextDouble();
+                world.addParticle(ParticleTypes.NOTE,
+                    pos.x + (world.random.nextDouble() - 0.5) * 0.4,
+                    pos.y + world.random.nextDouble() * 0.25,
+                    pos.z + (world.random.nextDouble() - 0.5) * 0.4,
+                    random, random, random);
+            }
         }
     }
 

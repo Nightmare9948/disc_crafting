@@ -1,6 +1,5 @@
 package cn.nightmare9948.disccrafting.client.audio;
 
-import cn.nightmare9948.disccrafting.client.Settings;
 import cn.nightmare9948.disccrafting.component.DiscSource;
 import cn.nightmare9948.disccrafting.entity.WalkmanEntity;
 import net.minecraft.util.math.BlockPos;
@@ -36,9 +35,9 @@ public final class WalkmanInheritance {
 
     /**
      * 放下的那一刻，手里那台随身听的一份快照：播放列表、音量（%）、单曲循环，
-     * 以及（空手放置时）正在放的那一首和播放状态。
+     * 以及（空手放置时）正在放的那一首。放下那台默认是停着的，所以 {@code playing} 恒为 false。
      *
-     * @param inheritTrack true = 曲目和播放状态也照抄手上那台；false = 只带列表和设置，
+     * @param inheritTrack true = 曲目也照抄手上那台；false = 只带列表和设置，
      *                     播放的曲目仍按“另一只手上的唱片”来
      */
     public record Snapshot(Playlist playlist, int volumePercent, boolean loop,
@@ -54,15 +53,13 @@ public final class WalkmanInheritance {
         }
         purgeExpired();
         DiscSource source = ClientAudio.get().handheldSource();
-        Playback playback = ClientAudio.get().handheldPlayback();
-        String trackId = source == null ? "" : source.trackId();
-        String songId = source == null ? "" : source.songId();
-        // 手上这台此刻在出声才让新的那台也出声；暂停着放下就还是暂停，进度和曲目都照抄
-        boolean playing = playback != null && playback.isActive();
+        WalkmanStates.State state = ClientAudio.handheldState();
+        // 正在放的那一首优先看播放层，其次看这支随身听自己记的进度
+        String trackId = source == null ? state.trackId : source.trackId();
+        String songId = source == null ? state.songId : source.songId();
         PENDING.add(new Pending(pos.toImmutable(), System.currentTimeMillis(),
-            new Snapshot(PlaylistStore.handheld().copy(),
-                Settings.volumePercent(), Settings.loopSingle(),
-                inheritTrack, trackId, songId, playing)));
+            new Snapshot(state.playlist.copy(), state.volumePercent, state.loop,
+                inheritTrack, trackId, songId, false)));
     }
 
     /**
